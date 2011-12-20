@@ -114,6 +114,9 @@ var ParallelArray = function () {
 //    is nothing more that a reduce using the binary max function.
 
     
+    // use Proxies to emulate square bracket index selection on ParallelArray objects
+    var enableProxies = false;
+
     // check whether the new extension is installed.
     var useWebCL = false;
     if (window.WebCL !== undefined) {
@@ -157,7 +160,7 @@ var ParallelArray = function () {
     var fingerprint = 0;
     var fingerprintTracker = [];
 
-    const Constants = {
+    var Constants = {
         // Some constants, when constants are added to JS adjust accordingly 
         "zeroStrideConstant"    : [ ],
         "oneStrideConstant"     : [1],
@@ -387,6 +390,67 @@ var ParallelArray = function () {
         return result;
     };
 
+    // Proxy handler for mapping [<number>] and [<Array>] to call of |get|.
+    // The forwarding part of this proxy is taken from
+    // https://developer.mozilla.org/en/JavaScript/Reference/Global_Objects/Proxy
+    // which in turn was copied from the ECMAScript wiki at
+    // http://wiki.ecmascript.org/doku.php?id=harmony:proxies&s=proxy
+    var makeIndexOpHandler = function makeIndexOpProxy (obj) {
+        return {  
+            // Fundamental traps  
+            getOwnPropertyDescriptor: function(name) {  
+                var desc = Object.getOwnPropertyDescriptor(obj, name);  
+                // a trapping proxy's properties must always be configurable  
+                if (desc !== undefined) { desc.configurable = true; }  
+                return desc;  
+            },  
+            getPropertyDescriptor:  function(name) {  
+                var desc = Object.getPropertyDescriptor(obj, name); // not in ES5  
+                // a trapping proxy's properties must always be configurable  
+                if (desc !== undefined) { desc.configurable = true; }  
+                return desc;  
+            },  
+            getOwnPropertyNames: function() {  
+                return Object.getOwnPropertyNames(obj);  
+            },  
+            getPropertyNames: function() {  
+                return Object.getPropertyNames(obj);                // not in ES5  
+            },  
+            defineProperty: function(name, desc) {  
+                Object.defineProperty(obj, name, desc);  
+            },  
+            delete: function(name) { return delete obj[name]; },     
+            fix: function() {  
+                if (Object.isFrozen(obj)) {  
+                    return Object.getOwnPropertyNames(obj).map(function(name) {  
+                               return Object.getOwnPropertyDescriptor(obj, name);  
+                           });  
+                }  
+                // As long as obj is not frozen, the proxy won't allow itself to be fixed  
+                return undefined; // will cause a TypeError to be thrown  
+            },  
+
+            // derived traps  
+            has:          function(name) { return name in obj; },  
+            hasOwn:       function(name) { return Object.prototype.hasOwnProperty.call(obj, name); },  
+            get:          function(receiver, name) { 
+                var idx = parseInt(name);
+                if (idx == name) {
+                    return obj.get(idx);
+                } else {
+                    return obj[name];
+                } 
+            },  
+            set:          function(receiver, name, val) { obj[name] = val; return true; }, // bad behavior when set fails in non-strict mode  
+            enumerate:    function() {  
+                var result = [];  
+                for (name in obj) { result.push(name); };  
+                return result;  
+            },  
+            keys: function() { return Object.keys(obj) }  
+        };  
+    }  
+        
 
     // Helper for constructor that generates an empty array.
     var createEmptyParallelArray = function createEmptyParallelArray () {
@@ -517,6 +581,7 @@ var ParallelArray = function () {
             requiresData(this, "join");
             requiresData(this, "slice");
             requiresData(this, "toString");
+            requiresData(this, "getArray");
         } else {
             this.materialize();
         }
@@ -738,10 +803,13 @@ var ParallelArray = function () {
         var result;
         var extraArgs; 
         var extraArgOffset = 2;
-        if (typeof(depth) === 'function') {
+        if ((typeof(depth) === 'function') || (depth instanceof low_precision.wrapper)) {
             f = depth;
             depth = 1;
             extraArgOffset = 1;
+        }
+        if (f instanceof low_precision.wrapper) {
+            f = f.unwrap();
         }
         if (!this.isRegular()) {
             throw new TypeError("ParallelArray.combineSeq this is not a regular ParallelArray.");
@@ -831,8 +899,9 @@ var ParallelArray = function () {
     /***
     mapSeq
 
-    Elemental Function 
-        this - an element from the ParallelArray
+    Elemental Function
+        this - the entire ParallelArray 
+        val - an element from the ParallelArray
         Optional arguments - Same as the optional arguments passed to map 
     
     Result
@@ -844,9 +913,9 @@ var ParallelArray = function () {
             elements in the original ParallelArray plus any optional arguments.
 
     Example: an identity function
-        pa.map(function(){return this;})
+        pa.map(function(val){return val;})
     ***/
-        
+
     var mapSeq = function mapSeq (f) { // extra args passed unchanged and unindexed.
         var len = this.shape[0];
         var i, j;
@@ -862,14 +931,15 @@ var ParallelArray = function () {
 
         if (arguments.length == 1) { // Just a 1 arg function.
             for (i=0;i<len;i++) {
-                result[i] = f.call(this.get(i));
+                result[i] = f.apply(this, [this.get(i)]);
             }
         } else {
             for (i=0;i<len;i++) {
                 for (j=1;j<arguments.length;j++) {
-                    args[j-1] = (arguments[j] instanceof ParallelArray)?arguments[j].get(i):arguments[j];                    
+                    args[j] = arguments[j];
                 }              
-                result[i] = f.apply(this.get(i), args);
+                args[0] = this.get(i);
+                result[i] = f.apply(this, args);
             }
         }
         // SAH: temporary fix until we use cast
@@ -891,13 +961,12 @@ var ParallelArray = function () {
 
     var map = function map (f) { // extra args passed unchanged and unindexed.
         var len = this.shape[0];
-            var i;
-            var args = new Array(arguments.length-1);
-            var paResult;
-        if (arguments.length == 1) { // Just a 1 arg function.
+        var args = new Array(arguments.length-1);
+        var paResult;
+        if (arguments.length === 1) { // no extra arguments present
             paResult = RiverTrail.compiler.compileAndGo(this, f, "map", 1, args, enable64BitFloatingPoint);
         } else {            
-            for (j=1;j<arguments.length;j++) {
+            for (var j=1;j<arguments.length;j++) {
                 args[j-1] = arguments[j];                    
             }
             paResult = RiverTrail.compiler.compileAndGo(this, f, "map", 1, args, enable64BitFloatingPoint); 
@@ -1151,7 +1220,7 @@ var ParallelArray = function () {
     var filter = function filter(f) {
         var len = this.length;
         // Generate a ParallelArray where t means the corresponding value is in the resulting array.
-        var boolResults = this.map.apply(this, arguments);
+        var boolResults = combineSeq.apply(this, arguments);
         var rawResult;
         var i, j;
         var resultSize = 0;
@@ -1198,25 +1267,22 @@ var ParallelArray = function () {
         Handling conflicts
             Conflicts result when multiple elements are scattered to the same location.
             Conflicts results in a call to conflictFunction, which is an 
-                optional second argument to scatter
+                optional third argument to scatter
 
             Arguments
-                this is the input array, the same this that scatter sees.
-                index in this being considered
-                this.get(index) is the current value causing the conflict
+                this is value from the source array that is currently being scattered
                 Previous value – value in result placed there by some previous iteration
 
             It is the programmer’s responsibility to provide a conflictFunction that is 
-            associative since there is no guarantee in what order the conflicts will be 
-            resolved. If the function is not associative then the result could be any result 
-            return from the conflict function.
+            associative and commutative since there is no guarantee in what order the 
+            conflicts will be resolved. 
 
             Returns
                 Value to place in result[indices[index]]
 
             Example: Resolve conflict with larger number
-                chooseMax(index, prev){
-                    return (this.get(index)>prev)?this.get(index):prev;
+                chooseMax(prev){
+                    return (this>prev)?this:prev;
                 } 
                 
         ***/
@@ -1243,7 +1309,7 @@ var ParallelArray = function () {
             if (conflictResult[ind]) { // we have already placed a value at this location
                 if (hasConflictFunction) {
                     rawResult[ind] = 
-                        conflictFunction.call(rawResult[ind], this.get(i)); 
+                        conflictFunction.call(this.get(i), rawResult[ind]); 
                 } else {
                     throw new RangeError("Duplicate indices in scatter");
                 }
@@ -1271,14 +1337,19 @@ var ParallelArray = function () {
       If the element is a ParallelArray then it's elemets are also copied in to a JS Array.
      ***/
     var getArray = function getArray () {
-        var i;
-        var result = new Array(this.length);
-        for (i=0; i<this.length; i++) {
-            if (index instanceof ParallelArray) {
-                result[i] = this.get(i).getArray();
-            } else {
-                result[i] = this.get(i);
-            }            
+        var i, result;
+        if ((this.flat) && (this.shape.length === 1)) {
+            result = Array.prototype.slice.call(this.data, this.offset, this.offset + this.length);
+        } else {
+            result = new Array(this.length);
+            for (i=0; i<this.length; i++) {
+                var elem = this.get(i);
+                if (elem instanceof ParallelArray) {
+                    result[i] = elem.getArray();
+                } else {
+                    result[i] = elem;
+                }
+            }
         }
         return result;
     };
@@ -1326,6 +1397,12 @@ var ParallelArray = function () {
                     /* need to fix up shape somehow. */
                     result.shape = this.shape.slice(index.length);
                     result.strides = this.strides.slice(index.length); 
+                    /* changing the shape might invalidate the _fastClasses specialisation, 
+                     * so better ensure things are still fine
+                     */
+                    if (result.__proto__ !== ParallelArray.prototype) {
+                        result.__proto__ = _fastClasses[result.shape.length].prototype;
+                    }
                     return result;
                }
             } 
@@ -1687,7 +1764,7 @@ var ParallelArray = function () {
         }
         Fast1DPA.prototype = {
             "get" : function fastGet1D (index) {
-                const aLen = arguments.length;
+                var aLen = arguments.length;
                 if (aLen === 1) {
                     if (typeof(index) === "number") {
                         return this.data[this.offset + index];
@@ -1725,7 +1802,7 @@ var ParallelArray = function () {
         Fast2DPA.prototype = {
             "get" : function fastGet2D (index, index2) {
                 var result;
-                const aLen = arguments.length;
+                var aLen = arguments.length;
                 if (aLen === 2) {
                     return this.data[this.offset + index * this.strides[0] + index2];
                 } else if (aLen === 1) {
@@ -1770,7 +1847,7 @@ var ParallelArray = function () {
         Fast3DPA.prototype = {
             "get" : function fastGet3D (index, index2, index3) {
                 var result;
-                const aLen = arguments.length;
+                var aLen = arguments.length;
                 if (aLen === 3) {
                         return this.data[this.offset + index * this.strides[0] + index2 * this.strides[1] + index3];
                 } else if (aLen === 2) {
@@ -1853,6 +1930,12 @@ var ParallelArray = function () {
             result = new _fastClasses[result.shape.length](result);
         }
     
+        if (enableProxies) {
+            try { // for Chrome/Safari compatability
+                result = Proxy.create(makeIndexOpHandler(result), ParallelArray.prototype);
+            } catch (ignore) {}
+        }
+
         return result;
     };
 
